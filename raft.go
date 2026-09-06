@@ -22,8 +22,8 @@ const (
 	Dead
 )
 
-func (state CMState) String() string {
-	switch state {
+func (s CMState) String() string {
+	switch s {
 	case Follower:
 		return "Follower"
 	case Candidate:
@@ -33,7 +33,7 @@ func (state CMState) String() string {
 	case Dead:
 		return "Dead"
 	default:
-		panic(fmt.Sprintf("unknown CMState value: %d", state))
+		panic("unreachable")
 	}
 }
 
@@ -42,9 +42,28 @@ type LogEntry struct {
 	Term    int
 }
 
+type CommitEntry struct {
+	Command any
+	Index   int
+	Term    int
+}
+
 // ---------------------------------------------------------------------------
 // RPC types
 // ---------------------------------------------------------------------------
+
+// See figure 2 in the paper.
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
 
 // See figure 2 in the paper.
 type AppendEntriesArgs struct {
@@ -62,18 +81,6 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
 // ---------------------------------------------------------------------------
 // ConsensusModule
 // ---------------------------------------------------------------------------
@@ -86,34 +93,44 @@ type ConsensusModule struct {
 	peerIds []int // IDs of peers in the cluster
 	server  *Server // used for RPC calls
 
+	commitChan         chan<- CommitEntry
+	newCommitReadyChan chan struct{}
+
 	// Persistent state on all servers
 	currentTerm int
 	votedFor    int // candidate ID or -1
 	log         []LogEntry // first index is 0
 
 	// Volatile state on all servers
+	commitIndex        int
+	lastApplied        int
 	state              CMState
 	electionResetEvent time.Time
+
+	// Volatile state on leaders
+	nextIndex  map[int]int
+	matchIndex map[int]int
 }
 
 // ---------------------------------------------------------------------------
 // Construction / Lifecycle
 // ---------------------------------------------------------------------------
 
-// NewConsensusModule creates a new CM with the given ID, list of peer IDs and
-// server. The ready channel signals the CM that all peers are connected and
-// it's safe to start its state machine.
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.commitChan = commitChan
+	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.state = Follower
 	cm.votedFor = -1
+	cm.commitIndex = -1
+	cm.lastApplied = -1
+	cm.nextIndex = make(map[int]int)
+	cm.matchIndex = make(map[int]int)
 
 	go func() {
-		// The CM is quiescent until ready is signaled; then, it starts a countdown
-		// for leader election.
 		<-ready
 		cm.mu.Lock()
 		cm.electionResetEvent = time.Now()
@@ -121,7 +138,29 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any)
 		cm.runElectionTimer()
 	}()
 
+	go cm.commitChanSender()
 	return cm
+}
+
+// Report reports the state of this CM.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// Submit submits a new command to the CM.
+func (cm *ConsensusModule) Submit(command any) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.logger("Submit received by %v: %v", cm.state, command)
+	if cm.state == Leader {
+		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.logger("... log=%v", cm.log)
+		return true
+	}
+	return false
 }
 
 // Stop stops this CM, cleaning up its state. This method returns quickly, but
@@ -132,13 +171,7 @@ func (cm *ConsensusModule) Stop() {
 	defer cm.mu.Unlock()
 	cm.state = Dead
 	cm.logger("becomes Dead")
-}
-
-// Report reports the state of this CM.
-func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == Leader
+	close(cm.newCommitReadyChan)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +185,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
-	cm.logger("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.logger("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 
 	if args.Term > cm.currentTerm {
 		cm.logger("... term out of date in RequestVote")
@@ -160,7 +194,9 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 
 	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateId
 		cm.electionResetEvent = time.Now()
@@ -191,7 +227,36 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
-		reply.Success = true
+
+		if args.PrevLogIndex == -1 ||
+			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			reply.Success = true
+
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+
+			for {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+			if newEntriesIndex < len(args.Entries) {
+				cm.logger("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.logger("... log is now: %v", cm.log)
+			}
+
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
+				cm.logger("... setting commitIndex=%d", cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+		}
 	}
 
 	reply.Term = cm.currentTerm
@@ -219,7 +284,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
-	cm.currentTerm += 1 // should we lock here?, got the answer: no, we already lock before calling the function, another lock = deadlock
+	cm.currentTerm += 1
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
@@ -230,13 +295,19 @@ func (cm *ConsensusModule) startElection() {
 	// Send RequestVote RPCs to all other servers concurrently.
 	for _, peerId := range cm.peerIds {
 		go func() {
+			cm.mu.Lock()
+			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			cm.mu.Unlock()
+
 			args := RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateId: cm.id,
+				Term:         savedCurrentTerm,
+				CandidateId:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
 			}
-			var reply RequestVoteReply
 
 			cm.logger("sending RequestVote to %d: %+v", peerId, args)
+			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -270,11 +341,25 @@ func (cm *ConsensusModule) startElection() {
 	go cm.runElectionTimer()
 }
 
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
+	} else {
+		return -1, -1
+	}
+}
+
 // startLeader switches cm into a leader state and begins process of heartbeats.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.logger("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
+
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+	cm.logger("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
 	go func() {
 		ticker := time.NewTicker(50 * time.Millisecond)
@@ -307,20 +392,64 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderId: cm.id,
-		}
 		go func() {
-			cm.logger("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+			cm.mu.Lock()
+			ni := cm.nextIndex[peerId]
+			prevLogIndex := ni - 1
+			prevLogTerm := -1
+			if prevLogIndex >= 0 {
+				prevLogTerm = cm.log[prevLogIndex].Term
+			}
+			entries := cm.log[ni:]
+
+			args := AppendEntriesArgs{
+				Term:         savedCurrentTerm,
+				LeaderId:     cm.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: cm.commitIndex,
+			}
+			cm.mu.Unlock()
+			cm.logger("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				if reply.Term > savedCurrentTerm {
+				if reply.Term > cm.currentTerm {
 					cm.logger("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
+				}
+
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					if reply.Success {
+						cm.nextIndex[peerId] = ni + len(entries)
+						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+						cm.logger("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
+
+						savedCommitIndex := cm.commitIndex
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							if cm.log[i].Term == cm.currentTerm {
+								matchCount := 1
+								for _, peerId := range cm.peerIds {
+									if cm.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								if matchCount*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+						if cm.commitIndex != savedCommitIndex {
+							cm.logger("leader sets commitIndex := %d", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						cm.nextIndex[peerId] = ni - 1
+						cm.logger("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+					}
 				}
 			}
 		}()
@@ -338,11 +467,6 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Unlock()
 	cm.logger("election timer started (%v), term=%d", timeoutDuration, termStarted)
 
-	// This loops until either:
-	// - we discover the election timer is no longer needed, or
-	// - the election timer expires and this CM becomes a candidate
-	// In a follower, this typically keeps running in the background for the
-	// duration of the CM's lifetime.
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -361,8 +485,6 @@ func (cm *ConsensusModule) runElectionTimer() {
 			return
 		}
 
-		// Start an election if we haven't heard from a leader or haven't voted for
-		// someone for the duration of the timeout.
 		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
 			cm.startElection()
 			cm.mu.Unlock()
@@ -374,14 +496,39 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 // electionTimeout generates a pseudo-random election timeout duration.
 func (cm *ConsensusModule) electionTimeout() time.Duration {
-	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
-	// generating a hard-coded number very often. This will create collisions
-	// between different servers and force more re-elections.
 	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
 		return time.Duration(150) * time.Millisecond
 	} else {
 		return time.Duration(150+rand.Intn(150)) * time.Millisecond
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Log Replication
+// ---------------------------------------------------------------------------
+
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+		var entries []LogEntry
+		if cm.commitIndex > cm.lastApplied {
+			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.logger("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
+	cm.logger("commitChanSender done")
 }
 
 // ---------------------------------------------------------------------------

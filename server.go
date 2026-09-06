@@ -16,11 +16,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // Server wraps a raft.ConsensusModule along with a rpc.Server that exposes its
-// methods as RPC endpoints. It also manages the peers of the Raft server. The
-// main goal of this type is to simplify the code of raft.Server for
-// presentation purposes. raft.ConsensusModule has a *Server to do its peer
-// communication and doesn't have to worry about the specifics of running an
-// RPC server.
+// methods as RPC endpoints. It also manages the peers of the Raft server.
 type Server struct {
 	mu sync.Mutex
 
@@ -33,6 +29,7 @@ type Server struct {
 	rpcServer *rpc.Server
 	listener  net.Listener
 
+	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client
 
 	ready <-chan any
@@ -48,22 +45,21 @@ type RPCProxy struct {
 // Construction / Lifecycle
 // ---------------------------------------------------------------------------
 
-func NewServer(serverId int, peerIds []int, ready <-chan any) *Server {
+func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- CommitEntry) *Server {
 	s := new(Server)
 	s.serverId = serverId
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
 	s.ready = ready
+	s.commitChan = commitChan
 	s.quit = make(chan any)
 	return s
 }
 
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready)
+	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready, s.commitChan)
 
-	// Create a new RPC server and register a RPCProxy that forwards all methods
-	// to n.cm
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = &RPCProxy{cm: s.cm}
 	s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
@@ -163,8 +159,6 @@ func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
 	peer := s.peerClients[id]
 	s.mu.Unlock()
 
-	// If this is called after shutdown (where client.Close is called), it will
-	// return an error.
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	} else {
@@ -175,11 +169,10 @@ func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
-		switch dice {
-		case 9:
+		if dice == 9 {
 			rpp.cm.logger("drop RequestVote")
 			return fmt.Errorf("RPC failed")
-		case 8:
+		} else if dice == 8 {
 			rpp.cm.logger("delay RequestVote")
 			time.Sleep(75 * time.Millisecond)
 		}
@@ -192,11 +185,10 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
-		switch dice {
-		case 9:
+		if dice == 9 {
 			rpp.cm.logger("drop AppendEntries")
 			return fmt.Errorf("RPC failed")
-		case 8:
+		} else if dice == 8 {
 			rpp.cm.logger("delay AppendEntries")
 			time.Sleep(75 * time.Millisecond)
 		}
