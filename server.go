@@ -1,3 +1,6 @@
+// Adapted from Eli Bendersky's Raft implementation:
+// https://github.com/eliben/raft
+
 package raft
 
 import (
