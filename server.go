@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
 // Server wraps a raft.ConsensusModule along with a rpc.Server that exposes its
 // methods as RPC endpoints. It also manages the peers of the Raft server. The
 // main goal of this type is to simplify the code of raft.Server for
@@ -40,31 +44,9 @@ type RPCProxy struct {
 	cm *ConsensusModule
 }
 
-// DisconnectPeer disconnects this server from the peer identified by peerId.
-func (s *Server) DisconnectPeer(peerId int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.peerClients[peerId] != nil {
-		err := s.peerClients[peerId].Close()
-		s.peerClients[peerId] = nil
-		return err
-	}
-	return nil
-}
-
-func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
-	s.mu.Lock()
-	peer := s.peerClients[id]
-	s.mu.Unlock()
-
-	// If this is called after shutdown (where client.Close is called), it will
-	// return an error.
-	if peer == nil {
-		return fmt.Errorf("call client %d after it's closed", id)
-	} else {
-		return peer.Call(serviceMethod, args, reply)
-	}
-}
+// ---------------------------------------------------------------------------
+// Construction / Lifecycle
+// ---------------------------------------------------------------------------
 
 func NewServer(serverId int, peerIds []int, ready <-chan any) *Server {
 	s := new(Server)
@@ -117,18 +99,6 @@ func (s *Server) Serve() {
 	}()
 }
 
-// DisconnectAll closes all the client connections to peers for this server.
-func (s *Server) DisconnectAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id := range s.peerClients {
-		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
-			s.peerClients[id] = nil
-		}
-	}
-}
-
 // Shutdown closes the server and waits for it to shut down properly.
 func (s *Server) Shutdown() {
 	s.cm.Stop()
@@ -143,6 +113,10 @@ func (s *Server) GetListenAddr() net.Addr {
 	return s.listener.Addr()
 }
 
+// ---------------------------------------------------------------------------
+// Peer connectivity
+// ---------------------------------------------------------------------------
+
 func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,6 +128,48 @@ func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 		s.peerClients[peerId] = client
 	}
 	return nil
+}
+
+// DisconnectPeer disconnects this server from the peer identified by peerId.
+func (s *Server) DisconnectPeer(peerId int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerClients[peerId] != nil {
+		err := s.peerClients[peerId].Close()
+		s.peerClients[peerId] = nil
+		return err
+	}
+	return nil
+}
+
+// DisconnectAll closes all the client connections to peers for this server.
+func (s *Server) DisconnectAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.peerClients {
+		if s.peerClients[id] != nil {
+			s.peerClients[id].Close()
+			s.peerClients[id] = nil
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RPC forwarding
+// ---------------------------------------------------------------------------
+
+func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
+	s.mu.Lock()
+	peer := s.peerClients[id]
+	s.mu.Unlock()
+
+	// If this is called after shutdown (where client.Close is called), it will
+	// return an error.
+	if peer == nil {
+		return fmt.Errorf("call client %d after it's closed", id)
+	} else {
+		return peer.Call(serviceMethod, args, reply)
+	}
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {

@@ -9,6 +9,43 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// State & Log
+// ---------------------------------------------------------------------------
+
+type CMState int
+
+const (
+	Follower CMState = iota
+	Candidate
+	Leader
+	Dead
+)
+
+func (state CMState) String() string {
+	switch state {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Dead:
+		return "Dead"
+	default:
+		panic(fmt.Sprintf("unknown CMState value: %d", state))
+	}
+}
+
+type LogEntry struct {
+	Command any
+	Term    int
+}
+
+// ---------------------------------------------------------------------------
+// RPC types
+// ---------------------------------------------------------------------------
+
 // See figure 2 in the paper.
 type AppendEntriesArgs struct {
 	Term     int
@@ -25,33 +62,6 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
-		return nil
-	}
-	cm.logger("AppendEntries: %+v", args)
-
-	if args.Term > cm.currentTerm {
-		cm.logger("... term out of date in AppendEntries")
-		cm.becomeFollower(args.Term)
-	}
-
-	reply.Success = false
-	if args.Term == cm.currentTerm {
-		if cm.state != Follower {
-			cm.becomeFollower(args.Term)
-		}
-		cm.electionResetEvent = time.Now()
-		reply.Success = true
-	}
-
-	reply.Term = cm.currentTerm
-	cm.logger("AppendEntries reply: %+v", *reply)
-	return nil
-}
-
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -64,56 +74,31 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// ---------------------------------------------------------------------------
+// ConsensusModule
+// ---------------------------------------------------------------------------
 
-type LogEntry struct {
-	Command any
-	Term int
-}
-
-type CMState int 
-
-const (
-	Follower CMState = iota
-	Candidate 
-	Leader
-	Dead
-)
-
-func (state CMState) String() string {
-	switch state {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	case Dead:
-		return "Dead"
-	default:
-		panic(fmt.Sprintf("unknown CMState value: %d", state))		
-	}
-}
-
-// ConsensusModule (CM) a single node of Raft consensus 
+// ConsensusModule (CM) a single node of Raft consensus
 type ConsensusModule struct {
-	mu sync.Mutex // Will be for all fields below
+	mu sync.Mutex // guards all fields below
 
-	id int // The server ID of this CM
+	id      int   // server ID of this CM
+	peerIds []int // IDs of peers in the cluster
+	server  *Server // used for RPC calls
 
-	peerIds []int // The ID of our peers in the cluster
-	
-	server *Server // The server containing this CM. Will be used for RPC calls
-
-	// Persistent states - for all servers 
+	// Persistent state on all servers
 	currentTerm int
-	votedFor int // Candidate ID or -1 if not there 
-	log []LogEntry // first index is 0 
+	votedFor    int // candidate ID or -1
+	log         []LogEntry // first index is 0
 
-	// Volatile states - for all servers
-	state CMState
-	electionResetEvent time.Time 
-
+	// Volatile state on all servers
+	state              CMState
+	electionResetEvent time.Time
 }
+
+// ---------------------------------------------------------------------------
+// Construction / Lifecycle
+// ---------------------------------------------------------------------------
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
 // server. The ready channel signals the CM that all peers are connected and
@@ -149,93 +134,92 @@ func (cm *ConsensusModule) Stop() {
 	cm.logger("becomes Dead")
 }
 
-
-// func (cm *ConsensusModule) runElectionTimer() {
-// 	randomTimeoutDuration := cm.electionTimeout()
-//   cm.mu.Lock()
-//   termStarted := cm.currentTerm
-//   cm.mu.Unlock()
-// 	cm.logger("election timer started (%v), term=%d", randomTimeoutDuration, termStarted)
-
-//   timer := time.NewTimer(randomTimeoutDuration)
-//   defer timer.Stop()
-
-//   for {
-//     <-timer.C
-
-//     cm.mu.Lock()
-//     if cm.state != Candidate && cm.state != Follower {
-//       cm.logger("in election timer state=%s, bailing out", cm.state)
-//       cm.mu.Unlock()
-//       return
-//     }
-
-//     if termStarted != cm.currentTerm {
-//       cm.logger("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
-//       cm.mu.Unlock()
-//       return
-//     }
-
-//     // Check if a heartbeat/vote reset occurred during this timer run
-//     if elapsed := time.Since(cm.electionResetEvent); elapsed >= randomTimeoutDuration {
-//       cm.startElection()
-//       cm.mu.Unlock()
-//       return
-//     }
-
-//     // A heartbeat/vote reset happened recently; recalculate remaining wait time and reset timer
-//     remaining := randomTimeoutDuration - time.Since(cm.electionResetEvent)
-//     timer.Reset(remaining)
-//     cm.mu.Unlock()
-//   }
-// }
-
-func (cm *ConsensusModule) runElectionTimer() {
-	timeoutDuration := cm.electionTimeout()
+// Report reports the state of this CM.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
-	termStarted := cm.currentTerm
-	cm.mu.Unlock()
-	cm.logger("election timer started (%v), term=%d", timeoutDuration, termStarted)
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
 
-	// This loops until either:
-	// - we discover the election timer is no longer needed, or
-	// - the election timer expires and this CM becomes a candidate
-	// In a follower, this typically keeps running in the background for the
-	// duration of the CM's lifetime.
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		<-ticker.C
+// ---------------------------------------------------------------------------
+// RPC handlers
+// ---------------------------------------------------------------------------
 
-		cm.mu.Lock()
-		if cm.state != Candidate && cm.state != Follower {
-			cm.logger("in election timer state=%s, bailing out", cm.state)
-			cm.mu.Unlock()
-			return
-		}
-
-		if termStarted != cm.currentTerm {
-			cm.logger("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
-			cm.mu.Unlock()
-			return
-		}
-
-		// Start an election if we haven't heard from a leader or haven't voted for
-		// someone for the duration of the timeout.
-		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
-			cm.startElection()
-			cm.mu.Unlock()
-			return
-		}
-		cm.mu.Unlock()
+// RequestVote RPC.
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
 	}
+	cm.logger("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	if args.Term > cm.currentTerm {
+		cm.logger("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if cm.currentTerm == args.Term &&
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.logger("... RequestVote reply: %+v", reply)
+	return nil
+}
+
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.logger("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.logger("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+		reply.Success = true
+	}
+
+	reply.Term = cm.currentTerm
+	cm.logger("AppendEntries reply: %+v", *reply)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// State transitions
+// ---------------------------------------------------------------------------
+
+// becomeFollower makes cm a follower and resets its state.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.logger("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.state = Follower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.electionResetEvent = time.Now()
+
+	go cm.runElectionTimer()
 }
 
 // startElection starts a new election with this CM as a candidate.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
-	cm.currentTerm += 1 // should we lock here?, got the answer: no, we already lock before calling the function, another lock = deadlock 
+	cm.currentTerm += 1 // should we lock here?, got the answer: no, we already lock before calling the function, another lock = deadlock
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
@@ -311,11 +295,6 @@ func (cm *ConsensusModule) startLeader() {
 	}()
 }
 
-func (cm *ConsensusModule) logger(format string, args ...any) {
-		format = fmt.Sprintf("[%d] ", cm.id) + format
-		log.Printf(format, args...)
-}
-
 // leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
 // replies and adjusts cm's state.
 func (cm *ConsensusModule) leaderSendHeartbeats() {
@@ -348,50 +327,49 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
-// Report reports the state of this CM.
-func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+// ---------------------------------------------------------------------------
+// Election timer
+// ---------------------------------------------------------------------------
+
+func (cm *ConsensusModule) runElectionTimer() {
+	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == Leader
-}
+	termStarted := cm.currentTerm
+	cm.mu.Unlock()
+	cm.logger("election timer started (%v), term=%d", timeoutDuration, termStarted)
 
-// becomeFollower makes cm a follower and resets its state.
-// Expects cm.mu to be locked.
-func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.logger("becomes Follower with term=%d; log=%v", term, cm.log)
-	cm.state = Follower
-	cm.currentTerm = term
-	cm.votedFor = -1
-	cm.electionResetEvent = time.Now()
+	// This loops until either:
+	// - we discover the election timer is no longer needed, or
+	// - the election timer expires and this CM becomes a candidate
+	// In a follower, this typically keeps running in the background for the
+	// duration of the CM's lifetime.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
 
-	go cm.runElectionTimer()
-}
+		cm.mu.Lock()
+		if cm.state != Candidate && cm.state != Follower {
+			cm.logger("in election timer state=%s, bailing out", cm.state)
+			cm.mu.Unlock()
+			return
+		}
 
-// RequestVote RPC.
-func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
-		return nil
+		if termStarted != cm.currentTerm {
+			cm.logger("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+			cm.mu.Unlock()
+			return
+		}
+
+		// Start an election if we haven't heard from a leader or haven't voted for
+		// someone for the duration of the timeout.
+		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
+			cm.startElection()
+			cm.mu.Unlock()
+			return
+		}
+		cm.mu.Unlock()
 	}
-	cm.logger("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
-
-	if args.Term > cm.currentTerm {
-		cm.logger("... term out of date in RequestVote")
-		cm.becomeFollower(args.Term)
-	}
-
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
-		reply.VoteGranted = true
-		cm.votedFor = args.CandidateId
-		cm.electionResetEvent = time.Now()
-	} else {
-		reply.VoteGranted = false
-	}
-	reply.Term = cm.currentTerm
-	cm.logger("... RequestVote reply: %+v", reply)
-	return nil
 }
 
 // electionTimeout generates a pseudo-random election timeout duration.
@@ -404,4 +382,13 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 	} else {
 		return time.Duration(150+rand.Intn(150)) * time.Millisecond
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func (cm *ConsensusModule) logger(format string, args ...any) {
+	format = fmt.Sprintf("[%d] ", cm.id) + format
+	log.Printf(format, args...)
 }
