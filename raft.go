@@ -4,6 +4,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -82,6 +84,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // ---------------------------------------------------------------------------
@@ -95,9 +100,12 @@ type ConsensusModule struct {
 	id      int   // server ID of this CM
 	peerIds []int // IDs of peers in the cluster
 	server  *Server // used for RPC calls
+	storage Storage
 
-	commitChan         chan<- CommitEntry
-	newCommitReadyChan chan struct{}
+	commitChan             chan<- CommitEntry
+	newCommitReadyChan     chan struct{}
+	newCommitReadyChanWg   sync.WaitGroup
+	triggerAEChan          chan struct{}
 
 	// Persistent state on all servers
 	currentTerm int
@@ -119,19 +127,25 @@ type ConsensusModule struct {
 // Construction / Lifecycle
 // ---------------------------------------------------------------------------
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
+	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+
+	if cm.storage.HasData() {
+		cm.restoreFromStorage()
+	}
 
 	go func() {
 		<-ready
@@ -141,6 +155,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any,
 		cm.runElectionTimer()
 	}()
 
+	cm.newCommitReadyChanWg.Add(1)
 	go cm.commitChanSender()
 	return cm
 }
@@ -153,28 +168,79 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 }
 
 // Submit submits a new command to the CM.
-func (cm *ConsensusModule) Submit(command any) bool {
+func (cm *ConsensusModule) Submit(command any) int {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	cm.logger("Submit received by %v: %v", cm.state, command)
 	if cm.state == Leader {
+		submitIndex := len(cm.log)
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage()
 		cm.logger("... log=%v", cm.log)
-		return true
+		cm.mu.Unlock()
+		cm.triggerAEChan <- struct{}{}
+		return submitIndex
 	}
-	return false
+
+	cm.mu.Unlock()
+	return -1
 }
 
-// Stop stops this CM, cleaning up its state. This method returns quickly, but
-// it may take a bit of time (up to ~election timeout) for all goroutines to
-// exit.
+// Stop stops this CM, cleaning up its state.
 func (cm *ConsensusModule) Stop() {
+	cm.logger("CM.Stop called")
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	cm.state = Dead
+	cm.mu.Unlock()
 	cm.logger("becomes Dead")
 	close(cm.newCommitReadyChan)
+	cm.newCommitReadyChanWg.Wait()
+}
+
+func (cm *ConsensusModule) restoreFromStorage() {
+	if termData, found := cm.storage.Get("currentTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+	if votedData, found := cm.storage.Get("votedFor"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(votedData))
+		if err := d.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+	if logData, found := cm.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +273,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.logger("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -259,10 +326,25 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.logger("... setting commitIndex=%d", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
 			}
+		} else {
+			if args.PrevLogIndex >= len(cm.log) {
+				reply.ConflictIndex = len(cm.log)
+				reply.ConflictTerm = -1
+			} else {
+				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+				var i int
+				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = i + 1
+			}
 		}
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.logger("AppendEntries reply: %+v", *reply)
 	return nil
 }
@@ -276,8 +358,11 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.logger("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
-	cm.currentTerm = term
-	cm.votedFor = -1
+	if term > cm.currentTerm {
+		cm.currentTerm = term
+		cm.votedFor = -1
+		cm.persistToStorage()
+	}
 	cm.electionResetEvent = time.Now()
 
 	go cm.runElectionTimer()
@@ -291,6 +376,7 @@ func (cm *ConsensusModule) startElection() {
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
+	cm.persistToStorage()
 	cm.logger("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	votesReceived := 1
@@ -329,7 +415,6 @@ func (cm *ConsensusModule) startElection() {
 					if reply.VoteGranted {
 						votesReceived += 1
 						if votesReceived*2 > len(cm.peerIds)+1 {
-							// Won the election!
 							cm.logger("wins election with %d votes", votesReceived)
 							cm.startLeader()
 							return
@@ -364,28 +449,45 @@ func (cm *ConsensusModule) startLeader() {
 	}
 	cm.logger("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
+	go func(heartbeatTimeout time.Duration) {
+		cm.leaderSendAEs()
 
-		// Send periodic heartbeats, as long as still leader.
+		t := time.NewTimer(heartbeatTimeout)
+		defer t.Stop()
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
-
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+			doSend := false
+			select {
+			case <-t.C:
+				doSend = true
+				t.Stop()
+				t.Reset(heartbeatTimeout)
+			case _, ok := <-cm.triggerAEChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(heartbeatTimeout)
 			}
-			cm.mu.Unlock()
+
+			if doSend {
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
-// leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
-// replies and adjusts cm's state.
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+// leaderSendAEs sends a round of AEs to all peers.
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	if cm.state != Leader {
 		cm.mu.Unlock()
@@ -418,10 +520,10 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
 				if reply.Term > cm.currentTerm {
 					cm.logger("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
+					cm.mu.Unlock()
 					return
 				}
 
@@ -429,7 +531,6 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					if reply.Success {
 						cm.nextIndex[peerId] = ni + len(entries)
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
-						cm.logger("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
 
 						savedCommitIndex := cm.commitIndex
 						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
@@ -445,14 +546,37 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 								}
 							}
 						}
+						cm.logger("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
 						if cm.commitIndex != savedCommitIndex {
 							cm.logger("leader sets commitIndex := %d", cm.commitIndex)
+							cm.mu.Unlock()
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
+						} else {
+							cm.mu.Unlock()
 						}
 					} else {
-						cm.nextIndex[peerId] = ni - 1
+						if reply.ConflictTerm >= 0 {
+							lastIndexOfTerm := -1
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+							if lastIndexOfTerm >= 0 {
+								cm.nextIndex[peerId] = lastIndexOfTerm + 1
+							} else {
+								cm.nextIndex[peerId] = reply.ConflictIndex
+							}
+						} else {
+							cm.nextIndex[peerId] = reply.ConflictIndex
+						}
 						cm.logger("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+						cm.mu.Unlock()
 					}
+				} else {
+					cm.mu.Unlock()
 				}
 			}
 		}()
@@ -511,6 +635,8 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // ---------------------------------------------------------------------------
 
 func (cm *ConsensusModule) commitChanSender() {
+	defer cm.newCommitReadyChanWg.Done()
+
 	for range cm.newCommitReadyChan {
 		cm.mu.Lock()
 		savedTerm := cm.currentTerm

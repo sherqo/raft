@@ -27,6 +27,7 @@ type Server struct {
 	peerIds  []int
 
 	cm       *ConsensusModule
+	storage  Storage
 	rpcProxy *RPCProxy
 
 	rpcServer *rpc.Server
@@ -41,18 +42,29 @@ type Server struct {
 }
 
 type RPCProxy struct {
+	mu sync.Mutex
 	cm *ConsensusModule
+
+	numCallsBeforeDrop int
+}
+
+func NewProxy(cm *ConsensusModule) *RPCProxy {
+	return &RPCProxy{
+		cm:                 cm,
+		numCallsBeforeDrop: -1,
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Construction / Lifecycle
 // ---------------------------------------------------------------------------
 
-func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
 	s := new(Server)
 	s.serverId = serverId
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
+	s.storage = storage
 	s.ready = ready
 	s.commitChan = commitChan
 	s.quit = make(chan any)
@@ -61,10 +73,10 @@ func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- 
 
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready, s.commitChan)
+	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan)
 
 	s.rpcServer = rpc.NewServer()
-	s.rpcProxy = &RPCProxy{cm: s.cm}
+	s.rpcProxy = NewProxy(s.cm)
 	s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
 
 	var err error
@@ -96,6 +108,23 @@ func (s *Server) Serve() {
 			}()
 		}
 	}()
+}
+
+// Submit wraps the underlying CM's Submit.
+func (s *Server) Submit(cmd any) int {
+	return s.cm.Submit(cmd)
+}
+
+// DisconnectAll closes all the client connections to peers for this server.
+func (s *Server) DisconnectAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.peerClients {
+		if s.peerClients[id] != nil {
+			s.peerClients[id].Close()
+			s.peerClients[id] = nil
+		}
+	}
 }
 
 // Shutdown closes the server and waits for it to shut down properly.
@@ -141,18 +170,6 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	return nil
 }
 
-// DisconnectAll closes all the client connections to peers for this server.
-func (s *Server) DisconnectAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id := range s.peerClients {
-		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
-			s.peerClients[id] = nil
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RPC forwarding
 // ---------------------------------------------------------------------------
@@ -165,8 +182,19 @@ func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	} else {
-		return peer.Call(serviceMethod, args, reply)
+		return s.rpcProxy.Call(peer, serviceMethod, args, reply)
 	}
+}
+
+// IsLeader checks if s thinks it's the leader in the Raft cluster.
+func (s *Server) IsLeader() bool {
+	_, _, isLeader := s.cm.Report()
+	return isLeader
+}
+
+// Proxy provides access to the RPC proxy.
+func (s *Server) Proxy() *RPCProxy {
+	return s.rpcProxy
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
@@ -199,4 +227,31 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.AppendEntries(args, reply)
+}
+
+func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args any, reply any) error {
+	rpp.mu.Lock()
+	if rpp.numCallsBeforeDrop == 0 {
+		rpp.mu.Unlock()
+		rpp.cm.logger("drop Call %s: %v", method, args)
+		return fmt.Errorf("RPC failed")
+	} else {
+		if rpp.numCallsBeforeDrop > 0 {
+			rpp.numCallsBeforeDrop--
+		}
+		rpp.mu.Unlock()
+		return peer.Call(method, args, reply)
+	}
+}
+
+func (rpp *RPCProxy) DropCallsAfterN(n int) {
+	rpp.mu.Lock()
+	defer rpp.mu.Unlock()
+	rpp.numCallsBeforeDrop = n
+}
+
+func (rpp *RPCProxy) DontDropCalls() {
+	rpp.mu.Lock()
+	defer rpp.mu.Unlock()
+	rpp.numCallsBeforeDrop = -1
 }
